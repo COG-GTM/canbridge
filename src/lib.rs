@@ -77,6 +77,10 @@ pub fn recv_wire<R: Read>(stream: &mut R) -> Result<WireFrameV1> {
     let frame: WireFrameV1 =
         postcard::from_bytes(&payload).context("Failed to deserialize frame")?;
 
+    if frame.version != 1 {
+        return Err(anyhow!("Unsupported wire version: {}", frame.version));
+    }
+
     if frame.data.len() > 64 {
         return Err(anyhow!("Data too large: {} bytes", frame.data.len()));
     }
@@ -144,13 +148,13 @@ pub fn wire_to_can(wire: &WireFrameV1) -> Result<CanAnyFrame> {
     }
 
     let id: Id = if is_extended {
-        Id::Extended(
-            ExtendedId::new(wire.can_id).ok_or_else(|| anyhow!("Invalid extended ID"))?,
-        )
+        Id::Extended(ExtendedId::new(wire.can_id).ok_or_else(|| anyhow!("Invalid extended ID"))?)
     } else {
+        if wire.can_id > 0x7FF {
+            return Err(anyhow!("Invalid standard ID"));
+        }
         Id::Standard(
-            StandardId::new(wire.can_id as u16)
-                .ok_or_else(|| anyhow!("Invalid standard ID"))?,
+            StandardId::new(wire.can_id as u16).ok_or_else(|| anyhow!("Invalid standard ID"))?,
         )
     };
 
@@ -166,8 +170,7 @@ pub fn wire_to_can(wire: &WireFrameV1) -> Result<CanAnyFrame> {
         Ok(CanAnyFrame::Remote(frame))
     } else {
         // Standard data frame
-        let frame =
-            CanDataFrame::new(id, &wire.data).context("Failed to create data frame")?;
+        let frame = CanDataFrame::new(id, &wire.data).context("Failed to create data frame")?;
         Ok(CanAnyFrame::Normal(frame))
     }
 }
