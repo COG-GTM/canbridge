@@ -2,8 +2,19 @@ use canbridge::{
     can_to_wire, frame_hash, recv_wire, send_wire, wire_to_can, WireFrameV1, FLAG_EFF, FLAG_ERR,
     FLAG_FD, FLAG_RTR,
 };
-use socketcan::{CanAnyFrame, CanDataFrame, CanFdFrame, CanRemoteFrame, EmbeddedFrame, ExtendedId, Id, StandardId};
+use socketcan::{
+    CanAnyFrame, CanDataFrame, CanFdFrame, CanRemoteFrame, EmbeddedFrame, ExtendedId, Id,
+    StandardId,
+};
 use std::io::Cursor;
+
+fn wire_roundtrip(frame: &WireFrameV1) -> WireFrameV1 {
+    let mut buffer = Vec::new();
+    send_wire(&mut buffer, frame).unwrap();
+    let decoded = recv_wire(&mut buffer.as_slice()).unwrap();
+    assert_eq!(*frame, decoded);
+    decoded
+}
 
 // ============================================================================
 // WireFrameV1 Serialization Tests
@@ -75,17 +86,54 @@ fn test_send_recv_wire_roundtrip() {
 
 #[test]
 fn test_recv_wire_oversized_payload_rejected() {
-    // Craft a malicious payload with length > 2048
-    let mut buffer = Vec::new();
-    let len: u16 = 3000;
-    buffer.extend_from_slice(&len.to_be_bytes());
-    buffer.extend(vec![0u8; 3000]);
-
-    let mut cursor = Cursor::new(buffer);
+    // Reject the length prefix before attempting to read the payload.
+    let mut cursor = Cursor::new(2049u16.to_be_bytes());
     let result = recv_wire(&mut cursor);
 
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("too large"));
+}
+
+#[test]
+fn test_recv_wire_unsupported_version_rejected() {
+    for version in [9, 0, 2, u8::MAX] {
+        let mut frame = WireFrameV1::new(0x123, &[1, 2, 3], 0);
+        frame.version = version;
+        let mut buffer = Vec::new();
+        send_wire(&mut buffer, &frame).unwrap();
+
+        let error = recv_wire(&mut buffer.as_slice())
+            .expect_err("unsupported wire version must be rejected");
+        assert_eq!(
+            error.to_string(),
+            format!("Unsupported wire version: {version}")
+        );
+    }
+}
+
+#[test]
+fn test_recv_wire_data_over_64_bytes_rejected() {
+    let frame = WireFrameV1::new(0x123, &[0; 65], FLAG_FD);
+    let mut buffer = Vec::new();
+    send_wire(&mut buffer, &frame).unwrap();
+
+    let error = recv_wire(&mut buffer.as_slice()).unwrap_err();
+    assert_eq!(error.to_string(), "Data too large: 65 bytes");
+}
+
+#[test]
+fn test_recv_wire_truncated_payload_rejected() {
+    let frame = WireFrameV1::new(0x123, &[1, 2, 3], 0);
+    let mut buffer = Vec::new();
+    send_wire(&mut buffer, &frame).unwrap();
+    buffer.pop();
+
+    let error = recv_wire(&mut buffer.as_slice()).unwrap_err();
+    assert_eq!(error.to_string(), "Failed to read payload");
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
 }
 
 #[test]
@@ -261,6 +309,7 @@ fn test_wire_to_can_remote_frame() {
 #[test]
 fn test_wire_to_can_error_frame_rejected() {
     let wire = WireFrameV1::new(0, &[1, 2, 3], FLAG_ERR);
+    let wire = wire_roundtrip(&wire);
     let result = wire_to_can(&wire);
 
     assert!(result.is_err());
@@ -269,15 +318,57 @@ fn test_wire_to_can_error_frame_rejected() {
 
 #[test]
 fn test_wire_to_can_invalid_standard_id() {
-    // Standard IDs are 11-bit (max 0x7FF)
-    let wire = WireFrameV1::new(0x800, &[1, 2, 3], 0); // Invalid: too large for standard
-    let result = wire_to_can(&wire);
+    for flags in [0, FLAG_RTR, FLAG_FD] {
+        let wire = wire_roundtrip(&WireFrameV1::new(0x800, &[], flags));
+        let error = wire_to_can(&wire).unwrap_err();
+        assert_eq!(error.to_string(), "Invalid standard ID");
+    }
+}
 
-    assert!(result.is_err());
+#[test]
+fn test_wire_to_can_truncated_standard_id_rejected() {
+    for flags in [0, FLAG_RTR, FLAG_FD] {
+        let wire = wire_roundtrip(&WireFrameV1::new(0x10123, &[], flags));
+        let error = wire_to_can(&wire)
+            .expect_err("must reject full-width standard ID 0x10123 before narrowing");
+        assert_eq!(error.to_string(), "Invalid standard ID");
+    }
+}
+
+#[test]
+fn test_wire_to_can_max_standard_id() {
+    for flags in [0, FLAG_RTR, FLAG_FD] {
+        let wire = wire_roundtrip(&WireFrameV1::new(0x7FF, &[], flags));
+        let frame = wire_to_can(&wire).unwrap();
+        assert_eq!(frame.id(), Id::Standard(StandardId::new(0x7FF).unwrap()));
+        assert_eq!(can_to_wire(&frame), wire);
+    }
+}
+
+#[test]
+fn test_wire_to_can_max_extended_id() {
+    for flags in [FLAG_EFF, FLAG_EFF | FLAG_RTR, FLAG_EFF | FLAG_FD] {
+        let wire = wire_roundtrip(&WireFrameV1::new(0x1FFFFFFF, &[], flags));
+        let frame = wire_to_can(&wire).unwrap();
+        assert_eq!(
+            frame.id(),
+            Id::Extended(ExtendedId::new(0x1FFFFFFF).unwrap())
+        );
+        assert_eq!(can_to_wire(&frame), wire);
+    }
+}
+
+#[test]
+fn test_wire_to_can_invalid_extended_id() {
+    for flags in [FLAG_EFF, FLAG_EFF | FLAG_RTR, FLAG_EFF | FLAG_FD] {
+        let wire = wire_roundtrip(&WireFrameV1::new(0x20000000, &[], flags));
+        let error = wire_to_can(&wire).unwrap_err();
+        assert_eq!(error.to_string(), "Invalid extended ID");
+    }
 }
 
 // ============================================================================
-// Round-Trip Tests (can_to_wire -> wire_to_can)
+// Round-Trip Tests (can_to_wire -> send_wire -> recv_wire -> wire_to_can)
 // ============================================================================
 
 #[test]
@@ -285,7 +376,7 @@ fn test_roundtrip_standard_frame() {
     let id = StandardId::new(0x123).unwrap();
     let original = CanDataFrame::new(Id::Standard(id), &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
 
-    let wire = can_to_wire(&CanAnyFrame::Normal(original.clone()));
+    let wire = wire_roundtrip(&can_to_wire(&CanAnyFrame::Normal(original)));
     let recovered = wire_to_can(&wire).unwrap();
 
     match recovered {
@@ -303,7 +394,7 @@ fn test_roundtrip_fd_frame_64_bytes() {
     let data: Vec<u8> = (0..64).collect();
     let original = CanFdFrame::new(Id::Standard(id), &data).unwrap();
 
-    let wire = can_to_wire(&CanAnyFrame::Fd(original.clone()));
+    let wire = wire_roundtrip(&can_to_wire(&CanAnyFrame::Fd(original)));
     let recovered = wire_to_can(&wire).unwrap();
 
     match recovered {
@@ -320,7 +411,7 @@ fn test_roundtrip_extended_id() {
     let id = ExtendedId::new(0x1FFFFFF).unwrap();
     let original = CanDataFrame::new(Id::Extended(id), &[0xAB, 0xCD]).unwrap();
 
-    let wire = can_to_wire(&CanAnyFrame::Normal(original.clone()));
+    let wire = wire_roundtrip(&can_to_wire(&CanAnyFrame::Normal(original)));
     let recovered = wire_to_can(&wire).unwrap();
 
     match recovered {
@@ -329,5 +420,27 @@ fn test_roundtrip_extended_id() {
             assert_eq!(f.data(), original.data());
         }
         _ => panic!("Expected Normal frame"),
+    }
+}
+
+#[test]
+fn test_roundtrip_remote_frame() {
+    for id in [
+        Id::Standard(StandardId::new(0x300).unwrap()),
+        Id::Extended(ExtendedId::new(0x1FFFFFFF).unwrap()),
+    ] {
+        // V1 has no separate DLC field, so only a zero-DLC remote frame is lossless.
+        let original = CanRemoteFrame::new_remote(id, 0).unwrap();
+        let wire = wire_roundtrip(&can_to_wire(&CanAnyFrame::Remote(original)));
+        let recovered = wire_to_can(&wire).unwrap();
+
+        match recovered {
+            CanAnyFrame::Remote(f) => {
+                assert_eq!(f.id(), original.id());
+                assert_eq!(f.dlc(), original.dlc());
+                assert_eq!(f.data(), original.data());
+            }
+            _ => panic!("Expected Remote frame"),
+        }
     }
 }
